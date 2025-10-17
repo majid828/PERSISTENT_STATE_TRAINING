@@ -11,5 +11,773 @@ from torch.autograd import Variable
 import sklearn
 from sklearn.preprocessing import StandardScaler
 from tqdm.notebook import trange, tqdm
-import os   
+import os
 
+# Configuration
+g = 1.271e8
+time_step = 1
+rain_probability_range = {"None": [0.3, 0.4],
+                          "Light": [0.4, 0.5],
+                          "Heavy": [0.1, 0.3]}
+
+threshold_precip = 0.01
+max_precip = 0.25
+
+# Distribution parameters
+rain_depth_range = {"Light": [0.0008108, 0.0009759], "Heavy": [0.2341, 0.0101, 0.009250]}
+bucket_attributes_range = {
+    "A_bucket": [5e2, 2e3],
+    "H_bucket": [0.1, 0.3],
+    "rA_spigot": [0.1, 0.2],
+    "rH_spigot": [0.05, 0.15],
+    "K_infiltration": [-13.8857, 1.1835],
+    "ET_parameter": [2.2447, 9.9807e-5, 0.0016],
+    "soil_depth": [0.3, 0.8]
+}
+
+bucket_attributes_list = list(bucket_attributes_range.keys())
+bucket_attributes_list.append('A_spigot')
+bucket_attributes_list.append('H_spigot')
+bucket_attributes_lstm_inputs = ['H_bucket', 'rA_spigot', 'rH_spigot', 'soil_depth']
+print("LSTM model input attributes", bucket_attributes_lstm_inputs)
+
+input_vars = ['precip', 'et', 'h_bucket']
+input_vars.extend(bucket_attributes_lstm_inputs)
+output_vars = ['q_total', 'q_overflow', 'q_spigot']
+n_input = len(input_vars)
+n_output = len(output_vars)
+
+noise = {"pet": 0.1, "et": 0.1, "q": 0.1, "head": 0.1}
+
+# Device configuration
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
+    print("Using CUDA device:", torch.cuda.get_device_name(0))
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print("Using Apple M3/M2/M1 (Metal) device")
+else:
+    device = 'cpu'
+    print("Using CPU")
+
+# Model parameters
+hidden_state_size = 128
+num_layers = 1
+num_epochs = 10
+batch_size = 128
+seq_length = 336
+learning_rate = 0.001
+
+n_buckets_split = {"train": 20, "val": 10, "test": 1}
+time_splits = {"warmup": 256, "train": 1032, "val": 1032, "test": 1032}
+
+num_records = time_splits["warmup"] + time_splits["train"] + time_splits["val"] + time_splits["test"] + seq_length * 3
+n_buckets = n_buckets_split["train"] + n_buckets_split["val"] + n_buckets_split["test"]
+
+def split_parameters():
+    buckets_for_training = list(range(0, n_buckets_split['train']))
+    buckets_for_val = list(range(n_buckets_split['train'], 
+                                 n_buckets_split['train'] + n_buckets_split['val']))
+    buckets_for_test = list(range(n_buckets - n_buckets_split['test'], n_buckets))
+
+    train_start = time_splits["warmup"] + seq_length
+    train_end   = time_splits["warmup"] + time_splits["train"]
+    val_start   = train_end + seq_length
+    val_end     = val_start + time_splits["val"]
+    test_start  = val_end + seq_length
+    test_end    = test_start + time_splits["test"]
+
+    train_split_parameters = [buckets_for_training, train_start, train_end]
+    val_split_parameters = [buckets_for_val, val_start, val_end]
+    test_split_parameters = [buckets_for_test, test_start, test_end]
+
+    return [train_split_parameters, val_split_parameters, test_split_parameters]
+
+[[buckets_for_training, train_start, train_end],
+ [buckets_for_val, val_start, val_end],
+ [buckets_for_test, test_start, test_end]] = split_parameters()
+
+def setup_buckets(n_buckets):
+    buckets = {bucket_attribute: [] for bucket_attribute in bucket_attributes_list}
+    buckets['A_spigot'] = []
+    buckets['H_spigot'] = []
+    
+    for i in range(n_buckets):
+        for attribute in bucket_attributes_list:
+            if attribute in ['A_bucket', 'H_bucket', 'rA_spigot', 'rH_spigot', 'soil_depth']:
+                buckets[attribute].append(np.random.uniform(
+                    bucket_attributes_range[attribute][0],
+                    bucket_attributes_range[attribute][1]
+                ))
+            elif attribute == 'K_infiltration':
+                buckets[attribute].append(np.random.normal(
+                    bucket_attributes_range[attribute][0],
+                    bucket_attributes_range[attribute][1]
+                ))
+            elif attribute == "ET_parameter":
+                buckets[attribute].append(stats.weibull_min.rvs(
+                    bucket_attributes_range[attribute][0],
+                    bucket_attributes_range[attribute][1],
+                    bucket_attributes_range[attribute][2]
+                ))
+
+        buckets['A_spigot'].append(np.pi * (0.5 * buckets['H_bucket'][i] * buckets['rA_spigot'][i]) ** 2)
+        buckets['H_spigot'].append(buckets['H_bucket'][i] * buckets['rH_spigot'][i])
+
+    h_water_level = [np.random.uniform(0, buckets["H_bucket"][i]) for i in range(n_buckets)]
+    mass_overflow = [0] * n_buckets
+
+    return buckets, h_water_level, mass_overflow
+
+buckets, h_water_level, mass_overflow = setup_buckets(n_buckets)
+
+def pick_rain_params():
+    buck_rain_params = [
+        rain_depth_range,
+        np.random.uniform(rain_probability_range["None"][0], rain_probability_range["None"][1]),
+        np.random.uniform(rain_probability_range["Heavy"][0], rain_probability_range["Heavy"][1]),
+        np.random.uniform(rain_probability_range["Light"][0], rain_probability_range["Light"][1])
+    ]
+    return buck_rain_params
+
+def random_rain(preceding_rain, bucket_rain_params):
+    depth_range, no_rain_probability, light_rain_probability, heavy_rain_probability = bucket_rain_params
+    
+    if np.random.uniform(0.01, 0.99) < no_rain_probability:
+        rain = 0
+    else:
+        rain = np.inf
+        if preceding_rain < threshold_precip:
+            if np.random.uniform(0.0, 1.0) < light_rain_probability:
+                while rain < 0 or rain > threshold_precip:
+                    rain = stats.gumbel_r.rvs(depth_range["Light"][0], depth_range["Light"][1])
+            else:
+                while rain < threshold_precip or rain > max_precip:
+                    rain = stats.genpareto.rvs(depth_range["Heavy"][0], depth_range["Heavy"][1], depth_range["Heavy"][2])
+        else:
+            if np.random.uniform(0.0, 1.0) < heavy_rain_probability:
+                while rain < threshold_precip or rain > max_precip:
+                    rain = stats.genpareto.rvs(depth_range["Heavy"][0], depth_range["Heavy"][1], depth_range["Heavy"][2])
+            else:
+                while rain < 0 or rain > threshold_precip:
+                    rain = stats.gumbel_r.rvs(depth_range["Light"][0], depth_range["Light"][1])
+    return rain
+
+# Generate rainfall data
+in_list = {}
+for ibuc in range(n_buckets):
+    bucket_rain_params = pick_rain_params()
+    in_list[ibuc] = [0]
+    for i in range(1, num_records):
+        in_list[ibuc].append(random_rain(in_list[ibuc][i-1], bucket_rain_params))
+
+# Simplified bucket simulation for demo
+def run_bucket_simulation(ibuc):
+    columns = ['precip', 'et', 'infiltration', 'h_bucket', 'q_overflow', 'q_spigot', 'q_total']
+    columns.extend(bucket_attributes_list)
+    df = pd.DataFrame(index=list(range(len(in_list[ibuc]))), columns=columns)
+
+    for t, precip_in in enumerate(in_list[ibuc]):
+        # Simplified water balance
+        h_water_level[ibuc] = max(0, h_water_level[ibuc] + precip_in - 0.001)
+        
+        et = max(0, 0.0001 * np.sin((np.pi / 12) * t) * np.random.normal(1, noise['pet']))
+        infiltration = 0.0005 * h_water_level[ibuc]
+        
+        h_water_level[ibuc] = max(0, h_water_level[ibuc] - et - infiltration)
+        
+        # Overflow
+        if h_water_level[ibuc] > buckets["H_bucket"][ibuc]:
+            mass_overflow[ibuc] = h_water_level[ibuc] - buckets["H_bucket"][ibuc]
+            h_water_level[ibuc] = buckets["H_bucket"][ibuc]
+        else:
+            mass_overflow[ibuc] = 0
+
+        # Spigot flow
+        h_head_over_spigot = max(0, h_water_level[ibuc] - buckets["H_spigot"][ibuc])
+        if h_head_over_spigot > 0:
+            spigot_out = min(0.001 * h_head_over_spigot, h_head_over_spigot)
+            h_water_level[ibuc] -= spigot_out
+        else:
+            spigot_out = 0
+
+        # Store results
+        df.loc[t, 'precip'] = precip_in
+        df.loc[t, 'et'] = et
+        df.loc[t, 'infiltration'] = infiltration
+        df.loc[t, 'h_bucket'] = h_water_level[ibuc]
+        df.loc[t, 'q_overflow'] = mass_overflow[ibuc]
+        df.loc[t, 'q_spigot'] = spigot_out
+        df.loc[t, 'q_total'] = mass_overflow[ibuc] + spigot_out
+        
+        for attribute in bucket_attributes_list:
+            df.loc[t, attribute] = buckets[attribute][ibuc]
+
+    return df
+
+# Generate simulation data
+bucket_dictionary = {}
+print("Generating bucket simulations...")
+for ibuc in range(n_buckets):
+    bucket_dictionary[ibuc] = run_bucket_simulation(ibuc)
+    if (ibuc + 1) % 5 == 0:
+        print(f"Completed {ibuc + 1}/{n_buckets} buckets")
+
+# =========================================
+# LSTM MODEL CLASSES
+# =========================================
+
+class PersistentLSTM(nn.Module):
+    def __init__(self, num_classes, input_size, hidden_size, num_layers, seq_length):
+        super(PersistentLSTM, self).__init__()
+        self.num_classes = num_classes
+        self.num_layers = num_layers
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.seq_length = seq_length
+
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, 
+                           num_layers=num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, num_classes)
+        
+        # Persistent states
+        self.hidden_state = None
+        self.cell_state = None
+
+    def init_hidden(self, batch_size):
+        self.hidden_state = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
+        self.cell_state = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
+
+    def reset_states(self):
+        self.hidden_state = None
+        self.cell_state = None
+
+    def forward(self, x):
+        if self.hidden_state is None or self.cell_state is None:
+            self.init_hidden(x.size(0))
+        
+        if self.hidden_state.size(1) != x.size(0):
+            self.init_hidden(x.size(0))
+        
+        lstm_out, (hn, cn) = self.lstm(x, (self.hidden_state, self.cell_state))
+        self.hidden_state = hn
+        self.cell_state = cn
+        
+        out = self.fc(lstm_out)
+        return out
+
+class StandardLSTM(nn.Module):
+    def __init__(self, num_classes, input_size, hidden_size, num_layers, seq_length):
+        super(StandardLSTM, self).__init__()
+        self.num_classes = num_classes
+        self.num_layers = num_layers
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.seq_length = seq_length
+
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, 
+                           num_layers=num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        out = self.fc(lstm_out)
+        return out
+
+# =========================================
+# DATA PREPARATION
+# =========================================
+
+def fit_scaler():
+    frames = [bucket_dictionary[ibuc].loc[train_start:train_end, input_vars] for ibuc in buckets_for_training]
+    df_in = pd.concat(frames)
+    scaler_in = StandardScaler()
+    scaler_in.fit(df_in)
+
+    frames = [bucket_dictionary[ibuc].loc[train_start:train_end, output_vars] for ibuc in buckets_for_training]
+    df_out = pd.concat(frames)
+    scaler_out = StandardScaler()
+    scaler_out.fit(df_out)
+    return scaler_in, scaler_out
+
+scaler_in, scaler_out = fit_scaler()
+
+def make_data_loader(start, end, bucket_list):
+    loader = {}
+    np_seq_X = {}
+    np_seq_y = {}
+
+    for ibuc in bucket_list:
+        df = bucket_dictionary[ibuc]
+        Xin = scaler_in.transform(df.loc[start:end, input_vars])
+        Yin = scaler_out.transform(df.loc[start:end, output_vars])
+
+        n_total = Xin.shape[0]
+        n_samples = n_total - seq_length + 1
+
+        X = np.zeros((n_samples, seq_length, n_input))
+        Y = np.zeros((n_samples, seq_length, n_output))
+
+        for i in range(n_samples):
+            X[i] = Xin[i:i+seq_length]
+            Y[i] = Yin[i:i+seq_length]
+
+        np_seq_X[ibuc] = X
+        np_seq_y[ibuc] = Y
+
+        ds = torch.utils.data.TensorDataset(torch.Tensor(X), torch.Tensor(Y))
+        loader[ibuc] = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False)  # No shuffle for persistent
+
+    return loader, np_seq_X, np_seq_y
+
+print("Creating data loaders...")
+train_loader, np_train_seq_X, np_train_seq_y = make_data_loader(train_start, train_end, buckets_for_training)
+val_loader, np_val_seq_X, np_val_seq_y = make_data_loader(val_start, val_end, buckets_for_val)
+
+# =========================================
+# CORRECTED TRAINING FUNCTIONS
+# =========================================
+
+def train_persistent_approach(model, train_loader, buckets_for_training, epochs=10):
+    """TRUE persistent training - maintains states across ALL batches sequentially"""
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    
+    epoch_losses = []
+    batch_losses = []
+    
+    for epoch in range(epochs):
+        print(f"\n[Persistent] Epoch {epoch+1}/{epochs}")
+        total_loss = 0
+        batch_count = 0
+        
+        # Initialize states at the start of each epoch
+        model.init_hidden(batch_size)
+        
+        # Process ALL training data sequentially
+        all_batches = []
+        for ibuc in buckets_for_training:
+            for batch_data, batch_targets in train_loader[ibuc]:
+                all_batches.append((batch_data, batch_targets, ibuc))
+        
+        for batch_idx, (data, targets, ibuc) in enumerate(all_batches):
+            data, targets = data.to(device), targets.to(device)
+            
+            # Forward pass with CURRENT persistent states
+            outputs = model(data)
+            
+            # Compute loss for the last timestep only
+            preds = outputs[:, -1, :]
+            true = targets[:, -1, :]
+            loss = criterion(preds, true)
+            
+            # Backpropagate ONLY through this batch
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            # Save states and detach from computation graph
+            model.hidden_state = model.hidden_state.detach().clone()
+            model.cell_state = model.cell_state.detach().clone()
+            
+            current_loss = loss.item()
+            total_loss += current_loss
+            batch_count += 1
+            batch_losses.append(current_loss)
+            
+            if batch_idx % 10 == 0:
+                print(f"  Batch {batch_idx}, Loss: {current_loss:.6f}, Bucket: {ibuc}")
+        
+        avg_epoch_loss = total_loss / batch_count
+        epoch_losses.append(avg_epoch_loss)
+        print(f"  Epoch {epoch+1} Average Loss: {avg_epoch_loss:.6f}")
+    
+    return model, epoch_losses, batch_losses
+
+def train_standard_approach(model, train_loader, buckets_for_training, epochs=10):
+    """Standard training - resets state every batch"""
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    
+    epoch_losses = []
+    batch_losses = []
+    
+    for epoch in range(epochs):
+        print(f"\n[Standard] Epoch {epoch+1}/{epochs}")
+        total_loss = 0
+        batch_count = 0
+        
+        for ibuc in buckets_for_training:
+            for batch_idx, (data, targets) in enumerate(train_loader[ibuc]):
+                data, targets = data.to(device), targets.to(device)
+                
+                # Forward pass (PyTorch automatically resets states)
+                outputs = model(data)
+                
+                # Compute loss
+                preds = outputs[:, -1, :]
+                true = targets[:, -1, :]
+                loss = criterion(preds, true)
+                
+                # Backpropagate and update weights
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                
+                current_loss = loss.item()
+                total_loss += current_loss
+                batch_count += 1
+                batch_losses.append(current_loss)
+                
+                if batch_idx % 10 == 0:
+                    print(f"  Batch {batch_idx}, Loss: {current_loss:.6f}, Bucket: {ibuc}")
+        
+        avg_epoch_loss = total_loss / batch_count
+        epoch_losses.append(avg_epoch_loss)
+        print(f"  Epoch {epoch+1} Average Loss: {avg_epoch_loss:.6f}")
+    
+    return model, epoch_losses, batch_losses
+
+# =========================================
+# VALIDATION AND METRICS
+# =========================================
+
+def calculate_nse(predictions, targets):
+    """Calculate Nash-Sutcliffe Efficiency"""
+    mean_target = np.mean(targets)
+    ss_res = np.sum((predictions - targets) ** 2)
+    ss_tot = np.sum((targets - mean_target) ** 2)
+    nse = 1 - (ss_res / ss_tot) if ss_tot != 0 else -999
+    return nse
+
+def calculate_rmse(predictions, targets):
+    """Calculate Root Mean Square Error"""
+    rmse = np.sqrt(np.mean((predictions - targets) ** 2))
+    return rmse
+
+def validate_model(model, val_loader, buckets_for_val, model_name, scaler_out, persistent=False):
+    """Comprehensive model validation"""
+    validation_results = {}
+    all_predictions = {}
+    
+    print(f"\n📊 Validating {model_name}...")
+    
+    for ibuc in buckets_for_val[:5]:  # Validate first 5 buckets
+        df = bucket_dictionary[ibuc]
+        
+        with torch.no_grad():
+            # Reset states for validation
+            if persistent and hasattr(model, 'reset_states'):
+                model.reset_states()
+            
+            # Get validation data
+            X_val = torch.Tensor(np_val_seq_X[ibuc]).to(device)
+            predictions = model(X_val)
+            
+            # Calculate metrics for each output variable
+            nse_values = {}
+            rmse_values = {}
+            predictions_denorm = {}
+            
+            for j, var in enumerate(output_vars):
+                # Get actual values (denormalized)
+                actual_values = df.loc[val_start:val_end, var].values[seq_length-1:]
+                
+                # Denormalize predictions
+                pred_normalized = predictions[:, -1, j].cpu().numpy()
+                mean_train = np.mean(df.loc[train_start:train_end, var])
+                std_train = np.std(df.loc[train_start:train_end, var])
+                pred_denorm = (pred_normalized * std_train) + mean_train
+                
+                predictions_denorm[var] = pred_denorm
+                
+                # Calculate metrics
+                nse_values[var] = calculate_nse(pred_denorm, actual_values)
+                rmse_values[var] = calculate_rmse(pred_denorm, actual_values)
+            
+            validation_results[ibuc] = {
+                'NSE': nse_values, 
+                'RMSE': rmse_values,
+                'predictions': predictions_denorm,
+                'actual': {var: df.loc[val_start:val_end, var].values[seq_length-1:] for var in output_vars}
+            }
+            
+            print(f"  Bucket {ibuc}:")
+            for var in output_vars:
+                print(f"    {var}: NSE={nse_values[var]:.4f}, RMSE={rmse_values[var]:.6f}")
+    
+    return validation_results
+
+# =========================================
+# COMPREHENSIVE COMPARISON
+# =========================================
+
+def plot_comprehensive_comparison(standard_losses, persistent_losses, 
+                                standard_val, persistent_val, 
+                                standard_batch_losses, persistent_batch_losses):
+    """Create comprehensive comparison plots"""
+    
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle('LSTM Training Approaches Comprehensive Comparison', fontsize=16, fontweight='bold')
+    
+    # 1. Training Loss Over Epochs
+    axes[0, 0].plot(standard_losses, 'b-o', label='Standard', linewidth=2, markersize=6)
+    axes[0, 0].plot(persistent_losses, 'r-s', label='Persistent', linewidth=2, markersize=6)
+    axes[0, 0].set_title('Epoch Loss Comparison')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Average Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # 2. Batch Loss Trends (smoothed)
+    window = 50
+    standard_smooth = pd.Series(standard_batch_losses).rolling(window=window, center=True).mean()
+    persistent_smooth = pd.Series(persistent_batch_losses).rolling(window=window, center=True).mean()
+    
+    axes[0, 1].plot(standard_smooth, 'b-', label='Standard', alpha=0.7, linewidth=1)
+    axes[0, 1].plot(persistent_smooth, 'r-', label='Persistent', alpha=0.7, linewidth=1)
+    axes[0, 1].set_title(f'Batch Loss Trends (Smoothed, window={window})')
+    axes[0, 1].set_xlabel('Batch Number')
+    axes[0, 1].set_ylabel('Smoothed Loss')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # 3. NSE Comparison
+    nse_std = []
+    nse_per = []
+    labels = []
+    
+    for ibuc in standard_val:
+        for var in output_vars:
+            nse_std.append(standard_val[ibuc]['NSE'][var])
+            nse_per.append(persistent_val[ibuc]['NSE'][var])
+            labels.append(f'B{ibuc}_{var}')
+    
+    x_pos = np.arange(len(nse_std))
+    width = 0.35
+    
+    axes[0, 2].bar(x_pos - width/2, nse_std, width, label='Standard', alpha=0.7, color='blue')
+    axes[0, 2].bar(x_pos + width/2, nse_per, width, label='Persistent', alpha=0.7, color='red')
+    axes[0, 2].set_title('NSE Comparison by Bucket and Variable')
+    axes[0, 2].set_ylabel('Nash-Sutcliffe Efficiency')
+    axes[0, 2].set_xticks(x_pos)
+    axes[0, 2].set_xticklabels(labels, rotation=45, ha='right')
+    axes[0, 2].legend()
+    axes[0, 2].grid(True, alpha=0.3)
+    
+    # 4. RMSE Comparison
+    rmse_std = []
+    rmse_per = []
+    
+    for ibuc in standard_val:
+        for var in output_vars:
+            rmse_std.append(standard_val[ibuc]['RMSE'][var])
+            rmse_per.append(persistent_val[ibuc]['RMSE'][var])
+    
+    axes[1, 0].bar(x_pos - width/2, rmse_std, width, label='Standard', alpha=0.7, color='blue')
+    axes[1, 0].bar(x_pos + width/2, rmse_per, width, label='Persistent', alpha=0.7, color='red')
+    axes[1, 0].set_title('RMSE Comparison by Bucket and Variable')
+    axes[1, 0].set_ylabel('RMSE')
+    axes[1, 0].set_xticks(x_pos)
+    axes[1, 0].set_xticklabels(labels, rotation=45, ha='right')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # 5. Prediction vs Actual for first bucket
+    ibuc = list(standard_val.keys())[0]
+    time_points = range(len(standard_val[ibuc]['actual']['q_total']))
+    
+    for j, var in enumerate(output_vars[:2]):  # Plot first 2 variables
+        axes[1, 1].plot(time_points[:200], standard_val[ibuc]['actual'][var][:200], 
+                       'k-', label='Actual' if j == 0 else "", linewidth=2, alpha=0.7)
+        axes[1, 1].plot(time_points[:200], standard_val[ibuc]['predictions'][var][:200], 
+                       'b--', label=f'Standard {var}' if j == 0 else "", alpha=0.8)
+        axes[1, 1].plot(time_points[:200], persistent_val[ibuc]['predictions'][var][:200], 
+                       'r--', label=f'Persistent {var}' if j == 0 else "", alpha=0.8)
+    
+    axes[1, 1].set_title(f'Predictions vs Actual (Bucket {ibuc})')
+    axes[1, 1].set_xlabel('Time Step')
+    axes[1, 1].set_ylabel('Value')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    # 6. Overall Performance Summary
+    avg_nse_std = np.mean(nse_std)
+    avg_nse_per = np.mean(nse_per)
+    avg_rmse_std = np.mean(rmse_std)
+    avg_rmse_per = np.mean(rmse_per)
+    
+    metrics = ['NSE (Higher Better)', 'RMSE (Lower Better)']
+    std_values = [avg_nse_std, avg_rmse_std]
+    per_values = [avg_nse_per, avg_rmse_per]
+    
+    x_metrics = np.arange(len(metrics))
+    axes[1, 2].bar(x_metrics - width/2, std_values, width, label='Standard', alpha=0.7, color='blue')
+    axes[1, 2].bar(x_metrics + width/2, per_values, width, label='Persistent', alpha=0.7, color='red')
+    axes[1, 2].set_title('Overall Performance Summary')
+    axes[1, 2].set_ylabel('Metric Value')
+    axes[1, 2].set_xticks(x_metrics)
+    axes[1, 2].set_xticklabels(metrics)
+    axes[1, 2].legend()
+    axes[1, 2].grid(True, alpha=0.3)
+    
+    # Add value labels on bars
+    for i, v in enumerate(std_values):
+        axes[1, 2].text(i - width/2, v + 0.01 * max(std_values + per_values), f'{v:.3f}', 
+                       ha='center', va='bottom', fontweight='bold')
+    for i, v in enumerate(per_values):
+        axes[1, 2].text(i + width/2, v + 0.01 * max(std_values + per_values), f'{v:.3f}', 
+                       ha='center', va='bottom', fontweight='bold')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return fig
+
+def print_detailed_comparison(standard_losses, persistent_losses, standard_val, persistent_val):
+    """Print detailed numerical comparison"""
+    print("\n" + "="*80)
+    print("DETAILED COMPARISON RESULTS")
+    print("="*80)
+    
+    # Training performance
+    print("\n📈 TRAINING PERFORMANCE:")
+    print(f"{'Epoch':<6} {'Standard Loss':<15} {'Persistent Loss':<15} {'Difference':<15}")
+    print("-" * 60)
+    for epoch, (std_loss, per_loss) in enumerate(zip(standard_losses, persistent_losses)):
+        diff = per_loss - std_loss
+        print(f"{epoch+1:<6} {std_loss:<15.6f} {per_loss:<15.6f} {diff:+.6f}")
+    
+    # Validation performance
+    print("\n📊 VALIDATION PERFORMANCE (Average across buckets):")
+    
+    nse_std_all = []
+    nse_per_all = []
+    rmse_std_all = []
+    rmse_per_all = []
+    
+    for ibuc in standard_val:
+        for var in output_vars:
+            nse_std_all.append(standard_val[ibuc]['NSE'][var])
+            nse_per_all.append(persistent_val[ibuc]['NSE'][var])
+            rmse_std_all.append(standard_val[ibuc]['RMSE'][var])
+            rmse_per_all.append(persistent_val[ibuc]['RMSE'][var])
+    
+    avg_nse_std = np.mean(nse_std_all)
+    avg_nse_per = np.mean(nse_per_all)
+    avg_rmse_std = np.mean(rmse_std_all)
+    avg_rmse_per = np.mean(rmse_per_all)
+    
+    print(f"\nNash-Sutcliffe Efficiency (NSE):")
+    print(f"  Standard Training:  {avg_nse_std:.4f}")
+    print(f"  Persistent Training: {avg_nse_per:.4f}")
+    print(f"  Difference: {avg_nse_per - avg_nse_std:+.4f}")
+    
+    print(f"\nRoot Mean Square Error (RMSE):")
+    print(f"  Standard Training:  {avg_rmse_std:.6f}")
+    print(f"  Persistent Training: {avg_rmse_per:.6f}")
+    print(f"  Difference: {avg_rmse_per - avg_rmse_std:+.6f}")
+    
+    # Final conclusion
+    print("\n🎯 FINAL CONCLUSION:")
+    nse_better = avg_nse_per > avg_nse_std
+    rmse_better = avg_rmse_per < avg_rmse_std
+    
+    if nse_better and rmse_better:
+        print("✅ Persistent State Training performs SIGNIFICANTLY BETTER! 🏆")
+        print("   The persistent approach better captures temporal dependencies.")
+    elif not nse_better and not rmse_better:
+        print("✅ Standard Training performs SIGNIFICANTLY BETTER! 🏆")
+        print("   The standard approach is more suitable for this dataset.")
+    else:
+        print("🔄 Mixed results - each approach has different strengths")
+        if nse_better:
+            print("   - Persistent training better captures pattern (higher NSE)")
+        if rmse_better:
+            print("   - Persistent training has lower error (lower RMSE)")
+    
+    print(f"\n💡 Recommendation: {'Use PERSISTENT training' if nse_better and rmse_better else 'Use STANDARD training'}")
+
+# =========================================
+# MAIN EXECUTION
+# =========================================
+
+def main():
+    print("🔬 PERSISTENT vs STANDARD LSTM TRAINING COMPARISON")
+    print("="*60)
+    
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # Approach 1: Persistent Training
+    print("\n🚀 1. PERSISTENT STATE TRAINING")
+    print("Maintaining LSTM states across ALL batches sequentially...")
+    
+    lstm_persistent = PersistentLSTM(
+        num_classes=n_output, 
+        input_size=n_input, 
+        hidden_size=hidden_state_size, 
+        num_layers=num_layers,
+        seq_length=seq_length
+    ).to(device)
+    
+    print(f"Persistent Model Parameters: {sum(p.numel() for p in lstm_persistent.parameters()):,}")
+    
+    lstm_persistent, persistent_epoch_losses, persistent_batch_losses = train_persistent_approach(
+        lstm_persistent, train_loader, buckets_for_training, epochs=num_epochs
+    )
+    
+    # Approach 2: Standard Training
+    print("\n🚀 2. STANDARD TRAINING")
+    print("Resetting LSTM states every batch...")
+    
+    lstm_standard = StandardLSTM(
+        num_classes=n_output, 
+        input_size=n_input, 
+        hidden_size=hidden_state_size, 
+        num_layers=num_layers,
+        seq_length=seq_length
+    ).to(device)
+    
+    print(f"Standard Model Parameters: {sum(p.numel() for p in lstm_standard.parameters()):,}")
+    
+    lstm_standard, standard_epoch_losses, standard_batch_losses = train_standard_approach(
+        lstm_standard, train_loader, buckets_for_training, epochs=num_epochs
+    )
+    
+    # Validation
+    print("\n📊 VALIDATION PHASE")
+    standard_val_results = validate_model(lstm_standard, val_loader, buckets_for_val, "STANDARD", scaler_out, persistent=False)
+    persistent_val_results = validate_model(lstm_persistent, val_loader, buckets_for_val, "PERSISTENT", scaler_out, persistent=True)
+    
+    # Comprehensive Comparison
+    print("\n📈 GENERATING COMPREHENSIVE COMPARISON...")
+    
+    # Create plots
+    fig = plot_comprehensive_comparison(
+        standard_epoch_losses, persistent_epoch_losses,
+        standard_val_results, persistent_val_results,
+        standard_batch_losses, persistent_batch_losses
+    )
+    
+    # Print detailed results
+    print_detailed_comparison(standard_epoch_losses, persistent_epoch_losses, 
+                            standard_val_results, persistent_val_results)
+    
+    print("\n✅ COMPARISON COMPLETE!")
+    
+    return {
+        'standard_model': lstm_standard,
+        'persistent_model': lstm_persistent,
+        'standard_losses': standard_epoch_losses,
+        'persistent_losses': persistent_epoch_losses,
+        'standard_val': standard_val_results,
+        'persistent_val': persistent_val_results
+    }
+
+# Run the comparison
+if __name__ == "__main__":
+    results = main()
