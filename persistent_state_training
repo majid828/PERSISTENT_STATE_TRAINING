@@ -27,10 +27,6 @@ else:
 # REAL CAMELS HOURLY DATA
 # ============================================================
 
-# Input/target files for the SAME basin (01333000)
-INPUT_CSV  = "CAMELS_data_sample/hourly/nldas_hourly/01333000_hourly_nldas.csv"
-OUTPUT_CSV = "CAMELS_data_sample/hourly/usgs-streamflow/01333000-usgs-hourly.csv"
-
 # CAMELS NLDAS input feature columns (exclude 'date')
 camels_input_cols = [
     "convective_fraction",
@@ -45,23 +41,16 @@ camels_input_cols = [
     "wind_u",
     "wind_v",
 ]
-
 # USGS/CAMELS target column
 target_col = "QObs_CAMELS(mm/h)"
 
 def load_camels_hourly(input_csv, output_csv):
     df_x = pd.read_csv(input_csv)
     df_y = pd.read_csv(output_csv)
-
-    # Parse timestamp
     df_x["date"] = pd.to_datetime(df_x["date"])
     df_y["date"] = pd.to_datetime(df_y["date"])
-
-    # Keep only needed cols
     df_x = df_x[["date"] + camels_input_cols]
     df_y = df_y["date"].to_frame().join(df_y[target_col])
-
-    # Merge on date (inner join to keep aligned hours) and drop NaNs
     df = (pd.merge(df_x, df_y, on="date", how="inner")
             .dropna(subset=camels_input_cols + [target_col])
             .sort_values("date")
@@ -69,8 +58,22 @@ def load_camels_hourly(input_csv, output_csv):
     df.index = np.arange(len(df))
     return df
 
-# One bucket (one basin)
-bucket_dictionary = {0: load_camels_hourly(INPUT_CSV, OUTPUT_CSV)}
+# ---- MULTI-BASIN: define 3 basins (fill the XXX/YYY ids you have) ----
+BASINS = [
+    dict(ibuc=0,
+         X="CAMELS_data_sample/hourly/nldas_hourly/01333000_hourly_nldas.csv",
+         Y="CAMELS_data_sample/hourly/usgs-streamflow/01333000-usgs-hourly.csv"),
+    dict(ibuc=1,
+         X="CAMELS_data_sample/hourly/nldas_hourly/01423000_hourly_nldas.csv",
+         Y="CAMELS_data_sample/hourly/usgs-streamflow/01423000-usgs-hourly.csv"),
+    dict(ibuc=2,
+         X="CAMELS_data_sample/hourly/nldas_hourly/02046000_hourly_nldas.csv",
+         Y="CAMELS_data_sample/hourly/usgs-streamflow/02046000-usgs-hourly.csv"),
+]
+
+bucket_dictionary = {}
+for b in BASINS:
+    bucket_dictionary[b["ibuc"]] = load_camels_hourly(b["X"], b["Y"])
 
 # ----------------------------
 # Globals / Params
@@ -105,8 +108,8 @@ def restrict_to_last_years(df, years_back=5):
         raise ValueError(f"Not enough rows after {years_back}y restriction: {len(df2)}")
     return df2
 
-bucket_dictionary[0] = restrict_to_last_years(bucket_dictionary[0], years_back=YEARS_BACK)
-N_total = len(bucket_dictionary[0])
+for ibuc in bucket_dictionary:
+    bucket_dictionary[ibuc] = restrict_to_last_years(bucket_dictionary[ibuc], years_back=YEARS_BACK)
 
 def compute_date_splits(df, train_years=15, val_years=4, test_years=1, seq_length=64):
     """Return inclusive index boundaries for train/val/test (df already last-N years)."""
@@ -131,33 +134,31 @@ def compute_date_splits(df, train_years=15, val_years=4, test_years=1, seq_lengt
         "test":  (i_test_start,  i_end)
     }
 
-date_splits = compute_date_splits(bucket_dictionary[0],
-                                  train_years=TRAIN_YEARS,
-                                  val_years=VAL_YEARS,
-                                  test_years=TEST_YEARS,
-                                  seq_length=seq_length)
+# per-basin splits
+date_splits = {}
+for ibuc in bucket_dictionary:
+    date_splits[ibuc] = compute_date_splits(bucket_dictionary[ibuc],
+                                            train_years=TRAIN_YEARS,
+                                            val_years=VAL_YEARS,
+                                            test_years=TEST_YEARS,
+                                            seq_length=seq_length)
 
-(train_start, train_end) = date_splits["train"]
-(val_start,   val_end)   = date_splits["val"]
-(test_start,  test_end)  = date_splits["test"]
+buckets_for_training = list(bucket_dictionary.keys())
+buckets_for_val      = list(bucket_dictionary.keys())
+buckets_for_test     = list(bucket_dictionary.keys())
 
-buckets_for_training = [0]
-buckets_for_val      = [0]
-buckets_for_test     = [0]
-
-print("Using only last 20 years:")
-print(f"Train idx: [{train_start}, {train_end}]  (~{TRAIN_YEARS}y)")
-print(f"Val   idx: [{val_start}, {val_end}]      (~{VAL_YEARS}y)")
-print(f"Test  idx: [{test_start}, {test_end}]    (~{TEST_YEARS}y)")
+print("Basins:", buckets_for_training)
+for ibuc in buckets_for_training:
+    tr = date_splits[ibuc]["train"]; va = date_splits[ibuc]["val"]; te = date_splits[ibuc]["test"]
+    print(f"ibuc={ibuc} Train[{tr[0]},{tr[1]}]  Val[{va[0]},{va[1]}]  Test[{te[0]},{te[1]}]")
 
 # ============================================================
-# MODELS (now with dropout)
+# MODELS (with dropout)
 # ============================================================
 class LSTMOriginal(nn.Module):
     """Stateless LSTM with dropout (internal + external)."""
     def __init__(self, num_classes, input_size, hidden_size, num_layers, dropout_p=0.3):
         super().__init__()
-        # Internal dropout active only if num_layers >= 2
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
@@ -165,7 +166,6 @@ class LSTMOriginal(nn.Module):
             batch_first=True,
             dropout=dropout_p
         )
-        # External dropout (applied to outputs of LSTM before Linear head)
         self.dropout = nn.Dropout(p=dropout_p)
         self.fc = nn.Linear(hidden_size, num_classes)
 
@@ -218,18 +218,28 @@ class LSTMPersistent(nn.Module):
         self.hidden = None
 
 # ----------------------------
-# Scalers (fit on TRAIN only)
+# Scalers (fit on TRAIN of all basins)
 # ----------------------------
-def fit_scaler():
-    frames_in  = [bucket_dictionary[ibuc].loc[train_start:train_end, input_vars]  for ibuc in buckets_for_training]
-    frames_out = [bucket_dictionary[ibuc].loc[train_start:train_end, output_vars] for ibuc in buckets_for_training]
-    df_in  = pd.concat(frames_in)
-    df_out = pd.concat(frames_out)
+def fit_scaler_multi():
+    frames_in, frames_out = [], []
+    for ibuc in buckets_for_training:
+        s,e = date_splits[ibuc]["train"]
+        df = bucket_dictionary[ibuc]
+        frames_in.append(df.loc[s:e, input_vars])
+        frames_out.append(df.loc[s:e, output_vars])
+    df_in  = pd.concat(frames_in,  axis=0)
+    df_out = pd.concat(frames_out, axis=0)
     scaler_in  = StandardScaler().fit(df_in)
     scaler_out = StandardScaler().fit(df_out)
     return scaler_in, scaler_out
 
-scaler_in, scaler_out = fit_scaler()
+scaler_in, scaler_out = fit_scaler_multi()
+
+def _denorm_from_scaler(x_std):
+    # for output_vars[0]
+    mu = float(scaler_out.mean_[0])
+    sd = float(scaler_out.scale_[0])  # StandardScaler stores std in 'scale_'
+    return max(x_std * sd + mu, 0.0)
 
 # ============================================================
 # Windowed datasets + loaders
@@ -255,10 +265,7 @@ def make_window_arrays(df, start_idx, end_idx, seq_length):
     return X, Y
 
 class SequentialBatchSampler(Sampler):
-    """
-    Sequential block sampler (stateless path):
-    Batch t = [t*B, t*B+1, ..., t*B+(B-1)].
-    """
+    """Sequential block sampler (stateless path)."""
     def __init__(self, n_samples: int, batch_size: int, seq_length: int):
         self.n_samples = n_samples
         self.batch_size = batch_size
@@ -275,12 +282,8 @@ class SequentialBatchSampler(Sampler):
 
 class SlotPreservingChunkSampler(Sampler):
     """
-| Batch | Slot 0      | Slot 1       | Slot 2        |
-| ----- | ----------- | ------------ | ------------- |
-| 0     | [0,1,2,3]   | [1,2,3,4]    | [2,3,4,5]     |
-| 1     | [4,5,6,7]   | [5,6,7,8]    | [6,7,8,9]     |
-| 2     | [8,9,10,11] | [9,10,11,12] | [10,11,12,13] |
-slot 1 → [1,2,3,4] → save/detach/load → [5,6,7,8] → save/detach/load → [9,10,11,12]
+    Batch 0: [0..L-1], [1..L], [2..L+1], ...
+    Batch 1: [+L .. +2L-1], ...
     """
     def __init__(self, n_samples: int, batch_size: int, seq_length: int):
         assert n_samples >= batch_size, "Need at least batch_size samples"
@@ -322,26 +325,43 @@ def make_persistent_loader(start, end, ibuc_list, batch_size):
         loader[ibuc] = DataLoader(ds, batch_sampler=sampler)
     return loader, arraysX, arraysY
 
-# Build loaders
-train_loader_std,  np_train_seq_X, np_train_seq_y = make_stateless_loader(
-    train_start, train_end, buckets_for_training, batch_size_stateless
-)
-val_loader_std,    np_val_seq_X,   np_val_seq_y   = make_stateless_loader(
-    val_start,   val_end,   buckets_for_val,      batch_size_stateless
-)
-test_loader_std,   np_test_seq_X,  np_test_seq_y  = make_stateless_loader(
-    test_start,  test_end,  buckets_for_test,     batch_size_stateless
-)
+def build_all_loaders():
+    train_loader_std, val_loader_std, test_loader_std = {}, {}, {}
+    train_loader_pers, val_loader_pers, test_loader_pers = {}, {}, {}
+    np_train_seq_X, np_val_seq_X, np_test_seq_X = {}, {}, {}
+    np_train_seq_y, np_val_seq_y, np_test_seq_y = {}, {}, {}
 
-train_loader_pers, _, _ = make_persistent_loader(
-    train_start, train_end, buckets_for_training, batch_size_persistent
-)
-val_loader_pers,   _, _ = make_persistent_loader(
-    val_start,   val_end,   buckets_for_val,      batch_size_persistent
-)
-test_loader_pers,  _, _ = make_persistent_loader(
-    test_start,  test_end,  buckets_for_test,     batch_size_persistent
-)
+    for ibuc in bucket_dictionary:
+        s_tr,e_tr = date_splits[ibuc]["train"]
+        s_va,e_va = date_splits[ibuc]["val"]
+        s_te,e_te = date_splits[ibuc]["test"]
+
+        # stateless
+        ld, X, Y = make_stateless_loader(s_tr, e_tr, [ibuc], batch_size_stateless)
+        train_loader_std[ibuc] = ld[ibuc]; np_train_seq_X[ibuc]=X[ibuc]; np_train_seq_y[ibuc]=Y[ibuc]
+        ld, X, Y = make_stateless_loader(s_va, e_va, [ibuc], batch_size_stateless)
+        val_loader_std[ibuc]   = ld[ibuc]; np_val_seq_X[ibuc]=X[ibuc];   np_val_seq_y[ibuc]=Y[ibuc]
+        ld, X, Y = make_stateless_loader(s_te, e_te, [ibuc], batch_size_stateless)
+        test_loader_std[ibuc]  = ld[ibuc]; np_test_seq_X[ibuc]=X[ibuc];  np_test_seq_y[ibuc]=Y[ibuc]
+
+        # persistent
+        ld, _, _ = make_persistent_loader(s_tr, e_tr, [ibuc], batch_size_persistent)
+        train_loader_pers[ibuc] = ld[ibuc]
+        ld, _, _ = make_persistent_loader(s_va, e_va, [ibuc], batch_size_persistent)
+        val_loader_pers[ibuc] = ld[ibuc]
+        ld, _, _ = make_persistent_loader(s_te, e_te, [ibuc], batch_size_persistent)
+        test_loader_pers[ibuc] = ld[ibuc]
+
+    return (train_loader_std, val_loader_std, test_loader_std,
+            train_loader_pers, val_loader_pers, test_loader_pers,
+            np_train_seq_X, np_val_seq_X, np_test_seq_X,
+            np_train_seq_y, np_val_seq_y, np_test_seq_y)
+
+# Build loaders for all basins
+(train_loader_std, val_loader_std, test_loader_std,
+ train_loader_pers, val_loader_pers, test_loader_pers,
+ np_train_seq_X, np_val_seq_X, np_test_seq_X,
+ np_train_seq_y, np_val_seq_y, np_test_seq_y) = build_all_loaders()
 
 # ============================================================
 # Training
@@ -349,7 +369,6 @@ test_loader_pers,  _, _ = make_persistent_loader(
 def train_original_model(lstm, train_loader, buckets_for_training):
     lstm.train()
     criterion = nn.MSELoss()
-    # >>> Added weight decay <<<
     optimizer = optim.Adam(lstm.parameters(), lr=float(learning_rate[0]), weight_decay=1e-5)
     results = {ibuc: {"loss": [], "RMSE": []} for ibuc in buckets_for_training}
 
@@ -390,7 +409,6 @@ def train_persistent_model(model, train_loader, buckets_for_training, batch_size
     - After each batch: step() then detach hidden (no cross-batch backprop).
     """
     model.train()
-    # >>> Added weight decay <<<
     optimizer = optim.Adam(model.parameters(), lr=float(learning_rate[0]), weight_decay=1e-5)
     criterion_all = nn.MSELoss(reduction="mean")
     epoch_losses = []
@@ -428,7 +446,7 @@ def train_persistent_model(model, train_loader, buckets_for_training, batch_size
     return model, results
 
 # ============================================================
-# Evaluation helpers & plotting (3 subplots, dotted predictions)
+# Evaluation helpers & plotting
 # ============================================================
 def compute_nse(pred, obs):
     pred = np.asarray(pred).ravel()
@@ -438,28 +456,23 @@ def compute_nse(pred, obs):
         return -999.0
     return 1.0 - np.sum((obs - pred)**2) / denom
 
-def _denorm(var, x, df):
-    mu = df.loc[train_start:train_end, var].mean()
-    sd = df.loc[train_start:train_end, var].std()
-    return max(x * sd + mu, 0.0)
-
-def predict_block_original(lstm_original, np_seq_X_dict, ibuc, df, var):
-    """Stateless predictions (dense)."""
+def predict_block_original(lstm_original, np_seq_X_dict, ibuc):
+    """Stateless predictions (dense). Returns list of last-step per window."""
     lstm_original.eval()
-    X = torch.tensor(np_seq_X_dict[ibuc], dtype=torch.float32, device=device)  # [N, T, C]
+    X = torch.tensor(np_seq_X_dict[ibuc], dtype=torch.float32, device=device)  # [N, L, F]
     with torch.no_grad():
-        out = lstm_original(X)               # [N, T, C]
+        out = lstm_original(X)               # [N, L, C]
         last = out[:, -1, :]                 # [N, C]
-    preds = [_denorm(var, float(last[i, 0].cpu().numpy()), df) for i in range(last.shape[0])]
-    return preds  # prediction i -> obs at (base_idx + seq_length - 1 + i)
+    preds = [_denorm_from_scaler(float(last[i, 0].cpu().numpy())) for i in range(last.shape[0])]
+    return preds
 
-def predict_block_persistent(lstm_persistent, np_seq_X_dict, ibuc, df, var, batch_size, base_idx):
+def predict_block_persistent(lstm_persistent, np_seq_X_dict, ibuc, batch_size, base_idx, df):
     """
     Stateful predictions (slot-preserving, step=L). Returns (obs_indices, preds).
     obs_indices are absolute df indices: base_idx + start + (seq_length - 1)
     """
     lstm_persistent.eval()
-    Xfull = torch.tensor(np_seq_X_dict[ibuc], dtype=torch.float32, device=device)  # [N, T, C]
+    Xfull = torch.tensor(np_seq_X_dict[ibuc], dtype=torch.float32, device=device)  # [N, L, F]
     preds_idx, preds_val = [], []
 
     sampler = SlotPreservingChunkSampler(
@@ -473,28 +486,83 @@ def predict_block_persistent(lstm_persistent, np_seq_X_dict, ibuc, df, var, batc
             x = Xfull[idx_batch]
             if lstm_persistent.hidden is None:
                 lstm_persistent.init_hidden(batch_size=x.size(0), device=device)
-            out = lstm_persistent(x)   # [B, T, C]
+            out = lstm_persistent(x)   # [B, L, C]
             last = out[:, -1, :]       # [B, C]
             for b, start_idx in enumerate(idx_batch):
                 obs_index = int(base_idx) + int(start_idx) + (seq_length - 1)
                 preds_idx.append(obs_index)
-                preds_val.append(_denorm(var, float(last[b, 0].cpu().numpy()), df))
+                preds_val.append(_denorm_from_scaler(float(last[b, 0].cpu().numpy())))
             lstm_persistent.detach_hidden()
     return preds_idx, preds_val
 
-def plot_train_val_test_subplots(lstm_original, lstm_persistent, var=output_vars[0]):
-    ibuc = 0
+def obs_dense_for(df, start_idx, end_idx, n_preds, var):
+    t0 = start_idx + (seq_length - 1)
+    t1 = min(t0 + n_preds - 1, end_idx)
+    obs = df.loc[t0:t1, var].values
+    dates = df.loc[t0:t1, "date"].values
+    return obs, dates
+
+def nse_sparse(idx_list, preds_list, df, s, e, var):
+    keep = [i for i in idx_list if (s + (seq_length - 1)) <= i <= e]
+    if not keep:
+        return np.nan
+    m = {i: v for i, v in zip(idx_list, preds_list)}
+    obs = [df.loc[i, var] for i in sorted(set(keep))]
+    prd = [m[i] for i in sorted(set(keep))]
+    return compute_nse(prd, obs)
+
+def eval_all_basins(lstm_o, lstm_p):
+    per_basin = {}
+    for ibuc in bucket_dictionary:
+        df = bucket_dictionary[ibuc]
+        s_tr,e_tr = date_splits[ibuc]["train"]
+        s_va,e_va = date_splits[ibuc]["val"]
+        s_te,e_te = date_splits[ibuc]["test"]
+
+        # Original (dense)
+        o_tr = predict_block_original(lstm_o, np_train_seq_X, ibuc)
+        o_va = predict_block_original(lstm_o, np_val_seq_X,   ibuc)
+        o_te = predict_block_original(lstm_o, np_test_seq_X,  ibuc)
+        obs_tr,_ = obs_dense_for(df, s_tr, e_tr, len(o_tr), output_vars[0])
+        obs_va,_ = obs_dense_for(df, s_va, e_va, len(o_va), output_vars[0])
+        obs_te,_ = obs_dense_for(df, s_te, e_te, len(o_te), output_vars[0])
+        nse_o_tr = compute_nse(o_tr[:len(obs_tr)], obs_tr)
+        nse_o_va = compute_nse(o_va[:len(obs_va)], obs_va)
+        nse_o_te = compute_nse(o_te[:len(obs_te)], obs_te)
+
+        # Persistent (sparse last-only)
+        idx_tr, p_tr = predict_block_persistent(lstm_p, np_train_seq_X, ibuc, batch_size_persistent, base_idx=s_tr, df=df)
+        idx_va, p_va = predict_block_persistent(lstm_p, np_val_seq_X,   ibuc, batch_size_persistent, base_idx=s_va, df=df)
+        idx_te, p_te = predict_block_persistent(lstm_p, np_test_seq_X,  ibuc, batch_size_persistent, base_idx=s_te, df=df)
+        nse_p_tr = nse_sparse(idx_tr, p_tr, df, s_tr, e_tr, output_vars[0])
+        nse_p_va = nse_sparse(idx_va, p_va, df, s_va, e_va, output_vars[0])
+        nse_p_te = nse_sparse(idx_te, p_te, df, s_te, e_te, output_vars[0])
+
+        per_basin[ibuc] = dict(orig=(nse_o_tr, nse_o_va, nse_o_te),
+                               pers=(nse_p_tr, nse_p_va, nse_p_te))
+
+    arr_o = np.array([per_basin[i]["orig"] for i in per_basin], dtype=float)
+    arr_p = np.array([per_basin[i]["pers"] for i in per_basin], dtype=float)
+    avg_orig = np.nanmean(arr_o, axis=0)  # (train,val,test)
+    avg_pers = np.nanmean(arr_p, axis=0)
+    return per_basin, avg_orig, avg_pers
+
+def plot_train_val_test_subplots_for(ibuc, lstm_original, lstm_persistent, var=target_col):
+    """Plot for a single basin id (default ibuc=0)."""
     df = bucket_dictionary[ibuc]
+    s_tr,e_tr = date_splits[ibuc]["train"]
+    s_va,e_va = date_splits[ibuc]["val"]
+    s_te,e_te = date_splits[ibuc]["test"]
 
     # Dense (original) predictions
-    orig_train = predict_block_original(lstm_original, np_train_seq_X, ibuc, df, var)
-    orig_val   = predict_block_original(lstm_original, np_val_seq_X,   ibuc, df, var)
-    orig_test  = predict_block_original(lstm_original, np_test_seq_X,  ibuc, df, var)
+    orig_train = predict_block_original(lstm_original, np_train_seq_X, ibuc)
+    orig_val   = predict_block_original(lstm_original, np_val_seq_X,   ibuc)
+    orig_test  = predict_block_original(lstm_original, np_test_seq_X,  ibuc)
 
     # Persistent predictions with absolute indices (slot-preserving, step=L)
-    idx_p_tr, pers_train = predict_block_persistent(lstm_persistent, np_train_seq_X, ibuc, df, var, batch_size_persistent, base_idx=train_start)
-    idx_p_va, pers_val   = predict_block_persistent(lstm_persistent, np_val_seq_X,   ibuc, df, var, batch_size_persistent, base_idx=val_start)
-    idx_p_te, pers_test  = predict_block_persistent(lstm_persistent, np_test_seq_X,  ibuc, df, var, batch_size_persistent, base_idx=test_start)
+    idx_p_tr, pers_train = predict_block_persistent(lstm_persistent, np_train_seq_X, ibuc, batch_size_persistent, base_idx=s_tr, df=df)
+    idx_p_va, pers_val   = predict_block_persistent(lstm_persistent, np_val_seq_X,   ibuc, batch_size_persistent, base_idx=s_va, df=df)
+    idx_p_te, pers_test  = predict_block_persistent(lstm_persistent, np_test_seq_X,  ibuc, batch_size_persistent, base_idx=s_te, df=df)
 
     # Helper: observations aligned to dense (original) coverage
     def obs_dense(start_idx, end_idx, n_preds):
@@ -504,14 +572,15 @@ def plot_train_val_test_subplots(lstm_original, lstm_persistent, var=output_vars
         dates = df.loc[t0:t1, "date"].values
         return obs, dates, t0, t1
 
-    obs_tr, dates_tr, t0_tr, t1_tr = obs_dense(train_start, train_end, len(orig_train))
-    obs_va, dates_va, t0_va, t1_va = obs_dense(val_start,   val_end,   len(orig_val))
-    obs_te, dates_te, t0_te, t1_te = obs_dense(test_start,  test_end,  len(orig_test))
+    obs_tr, dates_tr, _, _ = obs_dense(s_tr, e_tr, len(orig_train))
+    obs_va, dates_va, _, _ = obs_dense(s_va, e_va, len(orig_val))
+    obs_te, dates_te, _, _ = obs_dense(s_te, e_te, len(orig_test))
 
-    # NSE helpers
+    # NSE values
     NSE = lambda p, o: compute_nse(p[:len(o)], o)
+    nse_o_tr, nse_o_va, nse_o_te = NSE(orig_train, obs_tr), NSE(orig_val, obs_va), NSE(orig_test, obs_te)
 
-    def nse_sparse(idx_list, preds_list, start_idx, end_idx):
+    def nse_sparse_local(idx_list, preds_list, start_idx, end_idx):
         keep = [i for i in idx_list if (start_idx + (seq_length - 1)) <= i <= end_idx]
         if not keep:
             return np.nan
@@ -520,29 +589,25 @@ def plot_train_val_test_subplots(lstm_original, lstm_persistent, var=output_vars
         prd = [m[i]           for i in sorted(set(keep))]
         return compute_nse(prd, obs)
 
-    nse_o_tr, nse_o_va, nse_o_te = NSE(orig_train, obs_tr), NSE(orig_val, obs_va), NSE(orig_test, obs_te)
-    nse_p_tr = nse_sparse(idx_p_tr, pers_train, train_start, train_end)
-    nse_p_va = nse_sparse(idx_p_va, pers_val,   val_start,   val_end)
-    nse_p_te = nse_sparse(idx_p_te, pers_test,  test_start,  test_end)
+    nse_p_tr = nse_sparse_local(idx_p_tr, pers_train, s_tr, e_tr)
+    nse_p_va = nse_sparse_local(idx_p_va, pers_val,   s_va, e_va)
+    nse_p_te = nse_sparse_local(idx_p_te, pers_test,  s_te, e_te)
 
     # --- 3 subplots (dotted predictions) ---
     fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=False)
-
     panels = [
-        ("Train", dates_tr,    obs_tr,    orig_train,    (pd.to_datetime(df.loc[idx_p_tr, "date"]).values, pers_train), nse_o_tr, nse_p_tr),
-        ("Val",   dates_va,    obs_va,    orig_val,      (pd.to_datetime(df.loc[idx_p_va, "date"]).values, pers_val),   nse_o_va, nse_p_va),
-        ("Test",  dates_te,    obs_te,    orig_test,     (pd.to_datetime(df.loc[idx_p_te, "date"]).values, pers_test),  nse_o_te, nse_p_te),
+        ("Train", dates_tr, obs_tr, orig_train, (pd.to_datetime(df.loc[idx_p_tr, "date"]).values, pers_train), nse_o_tr, nse_p_tr),
+        ("Val",   dates_va, obs_va, orig_val,   (pd.to_datetime(df.loc[idx_p_va, "date"]).values, pers_val),   nse_o_va, nse_p_va),
+        ("Test",  dates_te, obs_te, orig_test,  (pd.to_datetime(df.loc[idx_p_te, "date"]).values, pers_test),  nse_o_te, nse_p_te),
     ]
-
     for ax, (name, dates, obs, orig_pred, (p_dates, p_pred), nse_o, nse_p) in zip(axes, panels):
         ax.plot(dates, obs, '-', linewidth=1.2, color='k', label=f'Actual ({name})')
         ax.plot(dates, orig_pred[:len(dates)], ':', linewidth=1.4, label=f'Original {name} NSE={nse_o:.3f}')
         ax.plot(p_dates, p_pred, ':', linewidth=1.4, label=f'Persistent {name} NSE={np.nan if nse_p is None else nse_p:.3f}')
         ax.set_ylabel(var)
-        ax.set_title(f'{name} Segment')
+        ax.set_title(f'ibuc={ibuc} — {name} Segment')
         ax.grid(True, alpha=0.3)
         ax.legend()
-
     axes[-1].set_xlabel('Time')
     fig.suptitle(f'{var} — Last 20 Years | Train(15y)/Val(4y)/Test(1y)', y=0.98)
     plt.tight_layout()
@@ -581,8 +646,14 @@ lstm_persistent, _ = train_persistent_model(
     lstm_persistent, train_loader_pers, buckets_for_training, batch_size_persistent
 )
 
-print("\n" + "="*60)
-print("TRAIN/VAL/TEST PREDICTION PLOTS (3 subplots, dotted preds)")
-print("="*60)
-plot_train_val_test_subplots(lstm_original, lstm_persistent, var=output_vars[0])
+# -------- EVALUATION: per-basin + macro-average --------
+per_basin, avg_orig, avg_pers = eval_all_basins(lstm_original, lstm_persistent)
+print("\nPer-basin NSE (train, val, test):")
+for i in sorted(per_basin):
+    print(f"ibuc {i}: Original {per_basin[i]['orig']},  Persistent {per_basin[i]['pers']}")
+print("\nMacro-average NSE (Original)  Train/Val/Test:", avg_orig)
+print("Macro-average NSE (Persistent) Train/Val/Test:", avg_pers)
 
+# -------- PLOT: choose a basin to visualize (default 0) --------
+print("\nPlotting basin ibuc=0 …")
+plot_train_val_test_subplots_for(ibuc=0, lstm_original=lstm_original, lstm_persistent=lstm_persistent, var=output_vars[0])
