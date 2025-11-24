@@ -1,0 +1,3 @@
+[submodule "CAMELS_data_sample"]
+	path = CAMELS_data_sample
+	url = https://github.com/majid828/CAMELS_data_sample.git
